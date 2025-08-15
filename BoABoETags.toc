@@ -1,9 +1,10 @@
-## Interface: 100000
-## Version: 1.0
+## Interface: 110200
+## Version: 1.1
 ## Title: BoA/BoE Tags
 ## Notes: Shows BoA/BoE text on inventory items
 ## Author: 0xfeeddeadbeef
 ## DefaultState: Enabled
 ## LoadOnDemand: 0
+## X-Curse-Project-ID: 694501
 
 BoABoETags.lua
