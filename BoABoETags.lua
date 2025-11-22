@@ -452,44 +452,148 @@ end
 -- New: explicit guild bank refresh (covers tab switches and data arrival)
 local function RefreshGuildBankButtons()
     if not IsGuildBankVisible() then return end
-    for col = 1, 7 do
-        for row = 1, 14 do
-            local btn = _G["GuildBankColumn"..col.."Button"..row]
-            if btn and btn:IsVisible() then
-                UpdateContainerButtonBind(btn)
+    
+    -- Use actual guild bank frame structure
+    if GuildBankFrame and GuildBankFrame.Columns then
+        for _, column in ipairs(GuildBankFrame.Columns) do
+            if column.Buttons then
+                for _, button in ipairs(column.Buttons) do
+                    if button:IsVisible() then
+                        QueueButtonUpdate(button)
+                    end
+                end
+            end
+        end
+    else
+        -- Fallback to legacy detection
+        for col = 1, 7 do
+            for row = 1, 14 do
+                local btn = _G["GuildBankColumn"..col.."Button"..row]
+                if btn and btn:IsVisible() then
+                    QueueButtonUpdate(btn)
+                    break  -- Exit early if button doesn't exist
+                elseif not btn then
+                    break
+                end
             end
         end
     end
 end
 
--- Forward declarations so the event handler captures locals (not globals)
-local ForEachContainerFrame
-local HookContainerFrames
-local RefreshAllVisibleItemButtons
-
--- Driver
-local driver = CreateFrame('Frame')
-local function SafeRegisterEvent(frame, eventName)
-    pcall(frame.RegisterEvent, frame, eventName)
+-- Fix: Consolidate hook creation to avoid duplicates
+local hookedButtons = {}
+local function EnsureButtonHooks(button)
+    if hookedButtons[button] then return end
+    hookedButtons[button] = true
+    
+    if button:HasScript("OnHide") then
+        button:HookScript("OnHide", function(b)
+            if b.bindsOnText then
+                b.bindsOnText:SetText("")
+                b.bindsOnText:Hide()
+            end
+            b._boaboe_lastLink = nil
+            b._boaboe_lastSource = nil
+        end)
+    end
+    
+    if button:HasScript("OnShow") then
+        button:HookScript("OnShow", function(b)
+            b._boaboe_lastLink = nil
+            b._boaboe_lastSource = nil
+            QueueButtonUpdate(b)
+        end)
+    end
 end
 
-SafeRegisterEvent(driver, 'PLAYER_LOGIN')
-SafeRegisterEvent(driver, 'ADDON_LOADED')
-SafeRegisterEvent(driver, 'BAG_UPDATE_DELAYED')
-SafeRegisterEvent(driver, 'BANKFRAME_OPENED')
-SafeRegisterEvent(driver, 'BANKFRAME_CLOSED')
-SafeRegisterEvent(driver, 'PLAYERBANKSLOTS_CHANGED')
+-- Fix: Optimize UpdateContainerButtonBind
+UpdateContainerButtonBind = function(button)
+    if type(button) ~= 'table' or not button.GetID then return end
+    
+    EnsureButtonHooks(button)
+    
+    local link, source, bag, slot
+    
+    -- Determine context once
+    if IsGuildBankButton(button) then
+        slot = button:GetID()
+        local tab = GetSelectedGuildBankTabSafe()
+        if tab and type(GetGuildBankItemLink) == 'function' then
+            local ok, l = pcall(GetGuildBankItemLink, tab, slot)
+            if ok then link = l end
+        end
+        source = "guild"
+    else
+        bag = (type(button.GetBagID) == 'function' and button:GetBagID()) or nil
+        if bag == nil and not IsGuildBankVisible() then
+            local parent = button:GetParent()
+            if parent and type(parent.GetBagID) == 'function' then
+                bag = parent:GetBagID()
+            elseif parent and type(parent.GetID) == 'function' then
+                bag = parent:GetID()
+            end
+        end
+        slot = button:GetID()
+        
+        if bag ~= nil and slot ~= nil then
+            link = ResolveButtonLink(button, bag, slot) or 
+                   (C_Container and C_Container.GetContainerItemLink and C_Container.GetContainerItemLink(bag, slot))
+            source = "bag"
+        else
+            link = ResolveButtonLink(button)
+            source = "link"
+        end
+    end
+    
+    -- Early exit if no item
+    if not link then
+        SetItemButtonBindType(button, nil)
+        button._boaboe_lastLink = nil
+        button._boaboe_lastSource = nil
+        return
+    end
+    
+    -- Skip if unchanged
+    if button._boaboe_lastLink == link and button._boaboe_lastSource == source then
+        return
+    end
+    
+    button._boaboe_lastLink = link
+    button._boaboe_lastSource = source
+    
+    -- Check cache first
+    local cacheKey = GetCacheKey(source, link)
+    local cached = GetCachedBind(source, link)
+    if cached ~= nil then
+        SetItemButtonBindType(button, cached or nil)
+        return
+    end
+    
+    -- Fetch and cache
+    local text
+    if source == "guild" then
+        text = GetBindTextFromLink(link) or GetGuildBankBindText(slot)
+    elseif source == "bag" then
+        text = GetBindText(bag, slot)
+        if text == nil then
+            text = GetBindTextFromLink(link)
+        end
+    else
+        text = GetBindTextFromLink(link)
+    end
+    
+    SetCachedBind(source, link, text)
+    SetItemButtonBindType(button, text)
+end
 
--- Guild bank events (safe across versions)
-SafeRegisterEvent(driver, 'GUILDBANKFRAME_OPENED')
-SafeRegisterEvent(driver, 'GUILDBANKFRAME_CLOSED')
-SafeRegisterEvent(driver, 'GUILDBANKBAGSLOTS_CHANGED')
-SafeRegisterEvent(driver, 'GUILDBANK_UPDATE_TABS')
-SafeRegisterEvent(driver, 'GUILDBANK_ITEM_LOCK_CHANGED')
-
--- Reagent bank was folded into bank; keep these safe in case of legacy clients
-SafeRegisterEvent(driver, 'REAGENTBANK_UPDATE')
-SafeRegisterEvent(driver, 'REAGENTBANK_PURCHASED')
+-- Fix: Debounce rapid-fire events
+local eventDebounce = {}
+local function DebounceEvent(eventName, delay, callback)
+    if eventDebounce[eventName] then
+        eventDebounce[eventName]:Cancel()
+    end
+    eventDebounce[eventName] = C_Timer.NewTimer(delay, callback)
+end
 
 driver:SetScript('OnEvent', function(self, event, arg1)
     if event == 'ADDON_LOADED' then
@@ -501,101 +605,33 @@ driver:SetScript('OnEvent', function(self, event, arg1)
         HookContainerFrames()
     elseif event == 'BANKFRAME_OPENED' then
         HookContainerFrames()
-        C_Timer.After(0, RefreshAllVisibleItemButtons)
+        DebounceEvent('bank', 0.1, RefreshAllVisibleItemButtons)
+        return
     elseif event == 'GUILDBANKFRAME_OPENED' then
-        C_Timer.After(0, RefreshGuildBankButtons)
+        DebounceEvent('guildbank', 0.1, RefreshGuildBankButtons)
+        return
     elseif event == 'GUILDBANK_UPDATE_TABS' or event == 'GUILDBANKBAGSLOTS_CHANGED' or event == 'GUILDBANK_ITEM_LOCK_CHANGED' then
-        C_Timer.After(0, RefreshGuildBankButtons)
+        DebounceEvent('guildbank', 0.05, RefreshGuildBankButtons)
+        return
     end
 
-    ForEachContainerFrame(function(frame)
-        if frame:IsShown() then
-            BindsWhen_OnUpdate(frame)
-        end
+    -- Debounce other bag events
+    DebounceEvent('bags', 0.1, function()
+        ForEachContainerFrame(function(frame)
+            if frame:IsShown() then
+                BindsWhen_OnUpdate(frame)
+            end
+        end)
+        RefreshAllVisibleItemButtons()
     end)
-    RefreshAllVisibleItemButtons()
-    RefreshGuildBankButtons()
 end)
 
--- Helper: iterate container-like frames (bags/bank) robustly
-ForEachContainerFrame = function(callback)
-    local seen = {}
-    local function consider(frame)
-        if type(frame) ~= 'table' or seen[frame] then return end
-        seen[frame] = true
-
-        if type(frame.EnumerateValidItems) == 'function' then
-            callback(frame)
-        end
-
-        if type(frame.GetChildren) == 'function' then
-            local num = select('#', frame:GetChildren())
-            for i = 1, num do
-                consider(select(i, frame:GetChildren()))
-            end
-        end
-    end
-
-    if type(ContainerFrameUtil_EnumerateContainerFrames) == 'function' then
-        for a, b in ContainerFrameUtil_EnumerateContainerFrames() do
-            local f = (type(b) == 'table' and b) or (type(a) == 'table' and a) or nil
-            if f then consider(f) end
-        end
-    end
-
-    if ContainerFrameCombinedBags then
-        consider(ContainerFrameCombinedBags)
-    end
-
-    -- Fallbacks: legacy container frames
-    for i = 1, 20 do
-        local f = _G["ContainerFrame"..i]
-        if f then consider(f) end
-    end
-
-    -- Include bank subtree if open (new bank UI)
-    if BankFrame and BankFrame:IsShown() then
-        consider(BankFrame)
-    end
-end
-
-HookContainerFrames = function()
-    ForEachContainerFrame(function(frame)
-        if frame._boaboe_hooked then return end
-        frame._boaboe_hooked = true
-
-        if type(frame.UpdateItems) == 'function' then
-            hooksecurefunc(frame, 'UpdateItems', BindsWhen_OnUpdate)
-        end
-        if frame:HasScript("OnShow") then
-            frame:HookScript("OnShow", function(f) BindsWhen_OnUpdate(f) end)
-        end
-        if frame:IsShown() then
-            BindsWhen_OnUpdate(frame)
-        end
-    end)
-end
-
--- Safety net: per-button OnUpdate (hits bank buttons too)
-if ContainerFrameItemButtonMixin and ContainerFrameItemButtonMixin.OnUpdate then
-    hooksecurefunc(ContainerFrameItemButtonMixin, 'OnUpdate', function(button)
-        if type(button) ~= 'table' then return end
-        UpdateContainerButtonBind(button)
-    end)
-end
-
--- Last-resort visible sweep to catch any item buttons (bags, bank, guild bank)
-RefreshAllVisibleItemButtons = function()
-    local f = EnumerateFrames()
-    while f do
-        if type(f) == 'table' and f:IsVisible() and type(f.GetID) == 'function' then
-            local hasResolver = (type(f.GetBagID) == 'function')
-                or (type(f.GetItemLocation) == 'function')
-                or IsGuildBankButton(f)
-            if hasResolver then
-                UpdateContainerButtonBind(f)
-            end
-        end
-        f = EnumerateFrames(f)
-    end
-end
+-- Fix: Clean up cache on logout to prevent memory bloat
+local cleanupFrame = CreateFrame("Frame")
+cleanupFrame:RegisterEvent("PLAYER_LOGOUT")
+cleanupFrame:SetScript("OnEvent", function()
+    wipe(bindCache)
+    wipe(textForItem)
+    wipe(textForItemHyperlink)
+    wipe(hookedButtons)
+end)
